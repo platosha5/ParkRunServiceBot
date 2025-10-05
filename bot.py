@@ -13,9 +13,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получение токена из переменных окружения
+# Получение токена из переменных окружения Railway
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-
 sqlConnectionName = 'DbParkRunning.db'
 
 def get_next_saturday():
@@ -350,9 +349,9 @@ def main():
     application.add_handler(CommandHandler("locationlist", location_list))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     
+    logger.info("🚀 Бот запускается...")
     while True:
         try:
-            logger.info("Запуск бота...")
             application.run_polling()
         except Exception as e:
             logger.error(f"Ошибка: {e}. Перезапуск через 10 секунд...")
