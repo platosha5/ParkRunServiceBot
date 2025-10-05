@@ -19,4 +19,4 @@ logs/
 
 # Файлы IDE (например, PyCharm)
 .idea/
-.vscode/
+.vscode/.env
