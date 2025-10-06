@@ -96,7 +96,8 @@ def get_event_data(location_id):
             SELECT 
                 R.role_id,
                 R.role_full_name, 
-                COALESCE(U.full_name, '') as volunteer_name
+                COALESCE(U.full_name, '') as volunteer_name,
+                U.telegram_name
             FROM role AS R
             LEFT JOIN volunteer AS V ON V.role_id = R.role_id 
                 AND V.event_id IN (
@@ -176,7 +177,7 @@ def get_position_text(location_name, positions):
     event_text = (
         f"Дата: {next_saturday}\n"
         f"Локация: {location_name}\n\n" 
-        "📋 Список позиций\n\n" + "\n".join([f"• {pos[1]}" + (f" - {pos[2]}" if pos[2] else "") for pos in positions]) + "\n\n"
+        "📋 Список позиций\n\n" + "\n".join([f"• {pos[1]}" + (f" - {pos[2]}" if pos[2] else "") + (f" {pos[3]}" if pos[3] else "") for pos in positions]) + "\n\n"
     )
 
     return event_text
