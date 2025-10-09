@@ -1,10 +1,11 @@
 import os
 import time
-import sqlite3
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 from datetime import datetime, timedelta
 import logging
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Настройка логирования
 logging.basicConfig(
@@ -15,7 +16,30 @@ logger = logging.getLogger(__name__)
 
 # Получение токена из переменных окружения Railway
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
-sqlConnectionName = 'DbParkRunning.db'
+
+def get_db_connection():
+    """Установка соединения с PostgreSQL"""
+    try:
+        # Для Railway
+        if 'DATABASE_URL' in os.environ:
+            conn = psycopg2.connect(
+                os.environ['DATABASE_URL'],
+                cursor_factory=RealDictCursor
+            )
+        else:
+            # Для локальной разработки
+            conn = psycopg2.connect(
+                host=os.environ.get('DB_HOST', 'localhost'),
+                port=os.environ.get('DB_PORT', '5432'),
+                database=os.environ.get('DB_NAME', 'parkrunning'),
+                user=os.environ.get('DB_USER', 'postgres'),
+                password=os.environ.get('DB_PASSWORD', ''),
+                cursor_factory=RealDictCursor
+            )
+        return conn
+    except Exception as e:
+        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
+        raise
 
 def get_next_saturday():
     today = datetime.now()
@@ -26,23 +50,20 @@ def get_next_saturday():
 
 next_saturday = get_next_saturday()
 
-def get_db_connection():
-    return sqlite3.connect(sqlConnectionName, timeout=10.0)
-
 def get_or_create_user(telegram_user):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         
         cursor.execute(
-            'SELECT user_id, first_name, full_name, qr_code FROM user WHERE user_id = ?', 
+            'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
             (telegram_user.id,)
         )
         user = cursor.fetchone()
         
         if user is None:
             cursor.execute('''
-                INSERT INTO user (user_id, first_name, last_name, full_name, telegram_name)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (user_id, first_name, last_name, full_name, telegram_name)
+                VALUES (%s, %s, %s, %s, %s)
             ''', (
                 telegram_user.id,
                 telegram_user.first_name or '',
@@ -53,7 +74,7 @@ def get_or_create_user(telegram_user):
             conn.commit()
             
             cursor.execute(
-                'SELECT user_id, first_name, full_name, qr_code FROM user WHERE user_id = ?', 
+                'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
                 (telegram_user.id,)
             )
             user = cursor.fetchone()
@@ -65,15 +86,15 @@ def get_or_create_event(location_id):
         cursor = conn.cursor()
         
         cursor.execute(
-                'SELECT event_id FROM event WHERE location_id = ? AND event_date = ?', 
-                (location_id, next_saturday)
-            )
+            'SELECT event_id FROM events WHERE location_id = %s AND event_date = %s', 
+            (location_id, next_saturday)
+        )
         event = cursor.fetchone()
         
         if event is None:
             cursor.execute('''
-                INSERT INTO event (location_id, event_date)
-                VALUES (?, ?)
+                INSERT INTO events (location_id, event_date)
+                VALUES (%s, %s)
             ''', (
                 location_id,
                 next_saturday
@@ -81,7 +102,7 @@ def get_or_create_event(location_id):
             conn.commit()
             
             cursor.execute(
-                'SELECT event_id FROM event WHERE location_id = ? AND event_date = ?', 
+                'SELECT event_id FROM events WHERE location_id = %s AND event_date = %s', 
                 (location_id, next_saturday)
             )
             event = cursor.fetchone()
@@ -89,7 +110,7 @@ def get_or_create_event(location_id):
     return event
 
 def get_event_data(location_id):
-    with get_db_connection()  as conn:
+    with get_db_connection() as conn:
         cursor = conn.cursor()
         
         cursor.execute('''
@@ -98,13 +119,13 @@ def get_event_data(location_id):
                 R.role_full_name, 
                 COALESCE(U.full_name, '') as volunteer_name,
                 U.telegram_name
-            FROM role AS R
-            LEFT JOIN volunteer AS V ON V.role_id = R.role_id 
+            FROM roles AS R
+            LEFT JOIN volunteers AS V ON V.role_id = R.role_id 
                 AND V.event_id IN (
-                    SELECT event_id FROM event 
-                    WHERE event_date = ? AND location_id = ?
+                    SELECT event_id FROM events 
+                    WHERE event_date = %s AND location_id = %s
                 )
-            LEFT JOIN user AS U ON U.user_id = V.user_id
+            LEFT JOIN users AS U ON U.user_id = V.user_id
             ORDER BY R.sort_id
         ''', (next_saturday, location_id))
         
@@ -117,13 +138,12 @@ def get_event_data(location_id):
 
 def add_volunteer_to_event(role_text, user_id, event_id):
     try:
-        # Сначала нужно получить role_id из базы данных
         with get_db_connection() as conn:
             cursor = conn.cursor()
             
             # Получаем role_id по названию роли
             cursor.execute(
-                'SELECT role_id FROM role WHERE role_full_name = ?', 
+                'SELECT role_id FROM roles WHERE role_full_name = %s', 
                 (role_text,)
             )
             role_result = cursor.fetchone()
@@ -132,28 +152,44 @@ def add_volunteer_to_event(role_text, user_id, event_id):
                 logger.error(f"Роль '{role_text}' не найдена")
                 return False
                 
-            role_id = role_result[0]
+            role_id = role_result['role_id']
             
-            cursor.execute('''
-                INSERT INTO volunteer (user_id, role_id, event_id)
-                VALUES (?, ?, ?)
-            ''', (user_id, role_id, event_id))
+            # Проверяем, не записан ли уже пользователь на эту роль
+            cursor.execute(
+                'SELECT volunteer_id FROM volunteers WHERE event_id = %s AND user_id = %s', 
+                (event_id, user_id)
+            )
+            existing_volunteer = cursor.fetchone()
+            
+            if existing_volunteer:
+                # Обновляем существующую запись
+                cursor.execute(
+                    'UPDATE volunteers SET role_id = %s WHERE volunteer_id = %s',
+                    (role_id, existing_volunteer['volunteer_id'])
+                )
+            else:
+                # Создаем новую запись
+                cursor.execute('''
+                    INSERT INTO volunteers (user_id, role_id, event_id)
+                    VALUES (%s, %s, %s)
+                ''', (user_id, role_id, event_id))
+            
             conn.commit()
-                   
-            return cursor.rowcount > 0
+            return True
             
     except Exception as e:
         logger.error(f"Ошибка при добавлении волонтера: {e}")
         return False
-    
+
 def remove_volunteer_from_event(user_id, event_id):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                'DELETE FROM volunteer WHERE event_id = ? AND user_id = ?', 
+                'DELETE FROM volunteers WHERE event_id = %s AND user_id = %s', 
                 (event_id, user_id)
             )
+            conn.commit()
             return cursor.rowcount > 0
             
     except Exception as e:
@@ -174,10 +210,19 @@ def check_parameters(user, location_id):
     return None
 
 def get_position_text(location_name, positions):
+    position_lines = []
+    for pos in positions:
+        line = f"• {pos['role_full_name']}"
+        if pos['volunteer_name']:
+            line += f" - {pos['volunteer_name']}"
+        if pos['telegram_name']:
+            line += f" @{pos['telegram_name']}"
+        position_lines.append(line)
+
     event_text = (
         f"Дата: {next_saturday}\n"
         f"Локация: {location_name}\n\n" 
-        "📋 Список позиций\n\n" + "\n".join([f"• {pos[1]}" + (f" - {pos[2]}" if pos[2] else "") + (f" {pos[3]}" if pos[3] else "") for pos in positions]) + "\n\n"
+        "📋 Список позиций\n\n" + "\n".join(position_lines) + "\n\n"
     )
 
     return event_text
@@ -201,52 +246,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if check_text:
         await update.message.reply_text(check_text)
-    
+
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command_text = update.message.text
     user = context.user_data.get('current_user')
     location = context.user_data.get('current_location')
     event = context.user_data.get('current_event')
 
-    check_text = check_parameters(user, location[1])
+    if not user or not location:
+        await update.message.reply_text("⚠️ Сначала выполни /start и выбери локацию через /location")
+        return
+
+    check_text = check_parameters(user, location['location_id'])
 
     if check_text:
         await update.message.reply_text(check_text)
+        return
 
     if 'записаться' in command_text.lower():
         keyboard = [
-                ["👨‍💼 Руководитель забега", "Координатор волонтеров", "💻 Обработка результатов"],
-                ["🏃‍♂ Подготовка трассы", "🤸‍♂ Разминка", "🏃‍♂ Замыкающий"],
-                ["⏱️ Секундомер", "🎫 Раздача карточек позиций", "📱 Сканер штрих-кодов"],
-                ["📸 Фотограф", "☕ Буфет", "❓ Другое"],
-            ]
+            ["👨‍💼 Руководитель забега", "Координатор волонтеров", "💻 Обработка результатов"],
+            ["🏃‍♂ Подготовка трассы", "🤸‍♂ Разминка", "🏃‍♂ Замыкающий"],
+            ["⏱️ Секундомер", "🎫 Раздача карточек позиций", "📱 Сканер штрих-кодов"],
+            ["📸 Фотограф", "☕ Буфет", "❓ Другое"],
+        ]
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text("Выбери позицию ниже:", reply_markup=reply_markup)
-
         return
     
     if 'отменить' in command_text.lower():
-        remove_volunteer_from_event(user[0], event[0])
-        positions = get_event_data(location[0])
-
-        if positions:
-            await update.message.reply_text(get_position_text(location[1], positions))
-
+        success = remove_volunteer_from_event(user['user_id'], event['event_id'])
+        if success:
+            positions = get_event_data(location['location_id'])
+            if positions:
+                await update.message.reply_text(get_position_text(location['location_name'], positions))
+        else:
+            await update.message.reply_text("❌ Не удалось отменить запись")
         return
        
-    add_volunteer_to_event(command_text, user[0], event[0])
-    positions = get_event_data(location[0])
+    success = add_volunteer_to_event(command_text, user['user_id'], event['event_id'])
+    if success:
+        positions = get_event_data(location['location_id'])
+        if positions:
+            event_text = get_position_text(location['location_name'], positions)
 
-    if positions:
-        event_text = get_position_text(location[1], positions)
+        keyboard = [
+            ["✍️ Записаться волонтером", "❌ Отменить запись"],
+        ]
 
-    keyboard = [
-    ["✍️ Записаться волонтером", "❌ Отменить запись"],
-    ]
-
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text(event_text, reply_markup=reply_markup)
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(event_text, reply_markup=reply_markup)
+    else:
+        await update.message.reply_text("❌ Не удалось записаться на выбранную позицию")
 
 async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text.strip()
@@ -256,12 +308,12 @@ async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         location_name = message_text
 
-    conn = get_db_connection() 
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
         cursor.execute(
-            "SELECT location_id, location_name FROM location WHERE location_name = ? AND statecode = 0 LIMIT 1", 
+            "SELECT location_id, location_name FROM locations WHERE location_name = %s AND statecode = 0 LIMIT 1", 
             (location_name,)
         )
         location = cursor.fetchone()
@@ -269,16 +321,16 @@ async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if location:
             context.user_data['current_location'] = location
 
-            event = get_or_create_event(location[0])
+            event = get_or_create_event(location['location_id'])
             context.user_data['current_event'] = event
 
-            positions = get_event_data(location[0])
+            positions = get_event_data(location['location_id'])
 
             if positions:
-                event_text = get_position_text(location[1], positions)
+                event_text = get_position_text(location['location_name'], positions)
 
             keyboard = [
-            ["✍️ Записаться волонтером", "❌ Отменить запись"],
+                ["✍️ Записаться волонтером", "❌ Отменить запись"],
             ]
 
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -289,28 +341,29 @@ async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(event_text)
 
         user = context.user_data.get('current_user')
-        check_text = check_parameters(user, location[0])
+        check_text = check_parameters(user, location['location_id'] if location else None)
         if check_text:
             await update.message.reply_text(check_text)   
             return
 
     except Exception as e:
         await update.message.reply_text(f"⚠️ Произошла ошибка при выборе локации: {str(e)}")
+        logger.error(f"Ошибка в location_command: {e}")
         
     finally:
         cursor.close()
         conn.close()
 
 async def location_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = get_db_connection() 
+    conn = get_db_connection()
     cursor = conn.cursor()
     
     try:
-        cursor.execute("SELECT location_name FROM location WHERE statecode = 0 ORDER BY location_name")
+        cursor.execute("SELECT location_name FROM locations WHERE statecode = 0 ORDER BY location_name")
         locations = cursor.fetchall()
         
         if locations:
-            location_text = "📋 Список доступных локаций:\n\n" + "\n".join([f"• {loc[0]}" for loc in locations])
+            location_text = "📋 Список доступных локаций:\n\n" + "\n".join([f"• {loc['location_name']}" for loc in locations])
         else:
             location_text = "❌ Нет доступных локаций"
             
@@ -318,10 +371,11 @@ async def location_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         await update.message.reply_text(f"⚠️ Произошла ошибка при получении списка локаций: {str(e)}")
+        logger.error(f"Ошибка в location_list: {e}")
         
     finally:
         cursor.close()
-        conn.close()  
+        conn.close()
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
@@ -336,11 +390,115 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Уведомляю руководителя забега о набранной команде\n"
     )
     await update.message.reply_text(help_text)
-                              
+
+def init_database():
+    """Инициализация таблиц в PostgreSQL"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Создаем таблицы, если они не существуют
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    statecode	INTEGER DEFAULT 0,
+                    parkrun_id	INTEGER,
+                    5verst_id	INTEGER,
+                    runpark_id	INTEGER,
+                    s95_id	INTEGER,
+                    first_name TEXT,
+                    last_name TEXT,
+                    full_name TEXT,
+                    telegram_name TEXT,
+                    qr_code TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS locations (
+                    location_id SERIAL PRIMARY KEY,
+                    location_name TEXT UNIQUE NOT NULL,
+                    statecode INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    modified_at	TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    tme_chat TEXT NULL,
+                    latitude REAL,
+                    longitude REAL,
+                    is_s95 INTEGER NOT NULL DEFAULT 0,
+                    is_5verst INTEGER NOT NULL DEFAULT 0,
+                    is_runpark INTEGER NOT NULL DEFAULT 0
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS roles (
+                    role_id SERIAL PRIMARY KEY,
+                    role_name TEXT UNIQUE NOT NULL,
+                    role_full_name TEXT UNIQUE NOT NULL,
+                    code TEXT NULL,
+                    sort_id INTEGER DEFAULT 0,
+                    is_uniq INTEGER DEFAULT 0
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS events (
+                    event_id SERIAL PRIMARY KEY,
+                    event_number INTEGER NULL,
+                    location_id INTEGER REFERENCES locations(location_id),
+                    event_date TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(location_id, event_date)
+                )
+            ''')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS volunteers (
+                    user_id BIGINT REFERENCES users(user_id),
+                    role_id INTEGER REFERENCES roles(role_id),
+                    event_id INTEGER REFERENCES events(event_id),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, role_id, event_id)
+                )
+            ''')
+            
+            # Добавляем базовые роли, если их нет
+            base_roles = [
+                ["Руководитель забега", "👨‍💼 Руководитель забега", "DIR", 1, 1],
+                ["Координатор волонтеров", "Координатор волонтеров", "COORD", 2, 1], 
+                ["Подготовка трассы", "🏃‍♂ Подготовка трассы", "PREPARE", 3, 0],
+                ["Разминка", "🤸‍♂ Разминка", "WARMUP", 4, 1],
+                ["Замыкающий", "🏃‍♂ Замыкающий", "LAST", 5, 0],
+                ["Секундомер", "⏱️ Секундомер", "SEC", 6, 0],
+                ["Раздача карточек позиций", "🎫 Раздача карточек позиций", "CARDS", 7, 0],
+                ["Сканер штрих-кодов", "📱 Сканер штрих-кодов", "SCANNER", 8, 0],
+                ["Фотограф", "📸 Фотограф", "PHOTO", 9, 0],
+                ["Обработка результатов", "💻 Обработка результатов", "POST", 10, 1],
+                ["Буфет", "☕ Буфет", "LUNCH", 11, 0],
+                ["Другое", "❓ Другое", "ANOTHER", 12, 0]
+            ]
+            
+            for role in base_roles:
+                cursor.execute(
+                    'INSERT INTO roles (role_name, role_full_name, code, sort_id, is_uniq) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (role_full_name) DO NOTHING',
+                    role  # Передаем кортеж напрямую
+                )
+            
+            conn.commit()
+            logger.info("Таблицы базы данных инициализированы")
+            
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации базы данных: {e}")
+
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не установлен!")
         return
+    
+    # Инициализация базы данных
+    init_database()
     
     application = Application.builder().token(BOT_TOKEN).build()
 
