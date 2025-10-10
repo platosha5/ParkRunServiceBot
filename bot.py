@@ -18,28 +18,29 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 
 def get_db_connection():
-    """Установка соединения с PostgreSQL"""
     try:
-        # Для Railway
-        if 'DATABASE_URL' in os.environ:
-            conn = psycopg2.connect(
-                os.environ['DATABASE_URL'],
-                cursor_factory=RealDictCursor
-            )
-        else:
-            # Для локальной разработки
-            conn = psycopg2.connect(
-                host=os.environ.get('DB_HOST', 'localhost'),
-                port=os.environ.get('DB_PORT', '5432'),
-                database=os.environ.get('DB_NAME', 'parkrunning'),
-                user=os.environ.get('DB_USER', 'postgres'),
-                password=os.environ.get('DB_PASSWORD', ''),
-                cursor_factory=RealDictCursor
-            )
+        database_url = os.environ.get('DATABASE_URL')
+        
+        if not database_url:
+            logger.error("DATABASE_URL environment variable is not set")
+            return None
+        
+        logger.info(f"Connecting to database: {database_url.split('@')[-1] if '@' in database_url else 'hidden'}")
+        
+        if database_url.startswith('postgres://'):
+            database_url = database_url.replace('postgres://', 'postgresql://', 1)
+        
+        # Подключаемся с SSL
+        conn = psycopg2.connect(
+            database_url,
+            sslmode='require'
+        )
+        logger.info("✅ Successfully connected to PostgreSQL")
         return conn
+        
     except Exception as e:
-        logger.error(f"Ошибка подключения к PostgreSQL: {e}")
-        raise
+        logger.error(f"❌ Database connection error: {e}")
+        return None
 
 def get_next_saturday():
     today = datetime.now()
@@ -391,114 +392,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(help_text)
 
-def init_database():
-    """Инициализация таблиц в PostgreSQL"""
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Создаем таблицы, если они не существуют
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    statecode	INTEGER DEFAULT 0,
-                    parkrun_id	INTEGER,
-                    5verst_id	INTEGER,
-                    runpark_id	INTEGER,
-                    s95_id	INTEGER,
-                    first_name TEXT,
-                    last_name TEXT,
-                    full_name TEXT,
-                    telegram_name TEXT,
-                    qr_code TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    modified_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS locations (
-                    location_id SERIAL PRIMARY KEY,
-                    location_name TEXT UNIQUE NOT NULL,
-                    statecode INTEGER DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    modified_at	TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    tme_chat TEXT NULL,
-                    latitude REAL,
-                    longitude REAL,
-                    is_s95 INTEGER NOT NULL DEFAULT 0,
-                    is_5verst INTEGER NOT NULL DEFAULT 0,
-                    is_runpark INTEGER NOT NULL DEFAULT 0
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS roles (
-                    role_id SERIAL PRIMARY KEY,
-                    role_name TEXT UNIQUE NOT NULL,
-                    role_full_name TEXT UNIQUE NOT NULL,
-                    code TEXT NULL,
-                    sort_id INTEGER DEFAULT 0,
-                    is_uniq INTEGER DEFAULT 0
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS events (
-                    event_id SERIAL PRIMARY KEY,
-                    event_number INTEGER NULL,
-                    location_id INTEGER REFERENCES locations(location_id),
-                    event_date TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(location_id, event_date)
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS volunteers (
-                    user_id BIGINT REFERENCES users(user_id),
-                    role_id INTEGER REFERENCES roles(role_id),
-                    event_id INTEGER REFERENCES events(event_id),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, role_id, event_id)
-                )
-            ''')
-            
-            # Добавляем базовые роли, если их нет
-            base_roles = [
-                ["Руководитель забега", "👨‍💼 Руководитель забега", "DIR", 1, 1],
-                ["Координатор волонтеров", "Координатор волонтеров", "COORD", 2, 1], 
-                ["Подготовка трассы", "🏃‍♂ Подготовка трассы", "PREPARE", 3, 0],
-                ["Разминка", "🤸‍♂ Разминка", "WARMUP", 4, 1],
-                ["Замыкающий", "🏃‍♂ Замыкающий", "LAST", 5, 0],
-                ["Секундомер", "⏱️ Секундомер", "SEC", 6, 0],
-                ["Раздача карточек позиций", "🎫 Раздача карточек позиций", "CARDS", 7, 0],
-                ["Сканер штрих-кодов", "📱 Сканер штрих-кодов", "SCANNER", 8, 0],
-                ["Фотограф", "📸 Фотограф", "PHOTO", 9, 0],
-                ["Обработка результатов", "💻 Обработка результатов", "POST", 10, 1],
-                ["Буфет", "☕ Буфет", "LUNCH", 11, 0],
-                ["Другое", "❓ Другое", "ANOTHER", 12, 0]
-            ]
-            
-            for role in base_roles:
-                cursor.execute(
-                    'INSERT INTO roles (role_name, role_full_name, code, sort_id, is_uniq) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (role_full_name) DO NOTHING',
-                    role  # Передаем кортеж напрямую
-                )
-            
-            conn.commit()
-            logger.info("Таблицы базы данных инициализированы")
-            
-    except Exception as e:
-        logger.error(f"Ошибка при инициализации базы данных: {e}")
-
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не установлен!")
         return
-    
-    # Инициализация базы данных
-    init_database()
     
     application = Application.builder().token(BOT_TOKEN).build()
 
