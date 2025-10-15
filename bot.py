@@ -14,32 +14,64 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получение токена из переменных окружения Railway
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
+# Определяем среду выполнения
+IS_RAILWAY = os.environ.get('RAILWAY_ENVIRONMENT') is not None
 
+if IS_RAILWAY:
+    # На Railway используем переменные окружения
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+    DATABASE_URL = os.environ.get('DATABASE_URL')
+    logger.info("🚀 Режим: Railway (PostgreSQL)")
+else:
+    # Локально используем .env файл
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        BOT_TOKEN = os.environ.get('BOT_TOKEN')
+        
+        # Локальные настройки PostgreSQL
+        DB_HOST = os.environ.get('DB_HOST', 'localhost')
+        DB_PORT = os.environ.get('DB_PORT', '5432')
+        DB_NAME = os.environ.get('DB_NAME', 'park_running')
+        DB_USER = os.environ.get('DB_USER', 'park_user')
+        DB_PASSWORD = os.environ.get('DB_PASSWORD', 'KX-p9CXS')
+        
+        DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+        logger.info("💻 Режим: Локальная разработка (PostgreSQL)")
+        
+    except ImportError:
+        logger.error("❌ Установите python-dotenv: pip install python-dotenv")
+        exit(1)
+        
 def get_db_connection():
     try:
-        database_url = os.environ.get('DATABASE_URL')
+        if IS_RAILWAY:
+            # Для Railway используем предоставленный URL
+            if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
+                database_url = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+            else:
+                database_url = DATABASE_URL
+            conn = psycopg2.connect(database_url, sslmode='require')
+        else:
+            # Локально подключаемся напрямую с правильной кодировкой
+            conn = psycopg2.connect(
+                host=os.environ.get('DB_HOST', 'localhost'),
+                port=os.environ.get('DB_PORT', '5432'),
+                database=os.environ.get('DB_NAME', 'park_running'),
+                user=os.environ.get('DB_USER', 'postgres'),  # Используем postgres по умолчанию
+                password=os.environ.get('DB_PASSWORD', 'password')
+            )
         
-        if not database_url:
-            logger.error("DATABASE_URL environment variable is not set")
-            return None
-        
-        logger.info(f"Connecting to database: {database_url.split('@')[-1] if '@' in database_url else 'hidden'}")
-        
-        if database_url.startswith('postgres://'):
-            database_url = database_url.replace('postgres://', 'postgresql://', 1)
-        
-        # Подключаемся с SSL
-        conn = psycopg2.connect(
-            database_url,
-            sslmode='require'
-        )
-        logger.info("✅ Successfully connected to PostgreSQL")
+        logger.info("✅ Успешное подключение к PostgreSQL")
         return conn
         
     except Exception as e:
-        logger.error(f"❌ Database connection error: {e}")
+        # Декодируем ошибку правильно для Windows
+        try:
+            error_msg = str(e).encode('latin1').decode('cp1251')
+        except:
+            error_msg = str(e)
+        logger.error(f"❌ Ошибка подключения к PostgreSQL: {error_msg}")
         return None
 
 def get_next_saturday():
@@ -153,21 +185,17 @@ def add_volunteer_to_event(role_text, user_id, event_id):
                 logger.error(f"Роль '{role_text}' не найдена")
                 return False
                 
-            role_id = role_result['role_id']
+            role_id = role_result[0]
             
             # Проверяем, не записан ли уже пользователь на эту роль
             cursor.execute(
-                'SELECT volunteer_id FROM volunteers WHERE event_id = %s AND user_id = %s', 
-                (event_id, user_id)
+                'SELECT user_id, role_id, event_id FROM volunteers WHERE user_id = %s AND role_id = %s AND event_id = %s', 
+                (user_id, role_id, event_id)
             )
             existing_volunteer = cursor.fetchone()
             
             if existing_volunteer:
-                # Обновляем существующую запись
-                cursor.execute(
-                    'UPDATE volunteers SET role_id = %s WHERE volunteer_id = %s',
-                    (role_id, existing_volunteer['volunteer_id'])
-                )
+                return False
             else:
                 # Создаем новую запись
                 cursor.execute('''
@@ -213,11 +241,11 @@ def check_parameters(user, location_id):
 def get_position_text(location_name, positions):
     position_lines = []
     for pos in positions:
-        line = f"• {pos['role_full_name']}"
-        if pos['volunteer_name']:
-            line += f" - {pos['volunteer_name']}"
-        if pos['telegram_name']:
-            line += f" @{pos['telegram_name']}"
+        line = f"• {pos[1]}"
+        if pos[2]:
+            line += f" - {pos[2]}"
+        if pos[3]:
+            line += f" {pos[3]}"
         position_lines.append(line)
 
     event_text = (
@@ -258,7 +286,12 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Сначала выполни /start и выбери локацию через /location")
         return
 
-    check_text = check_parameters(user, location['location_id'])
+    user_id = user.get('user_id') if isinstance(user, dict) else user[0] if user else None
+    location_id = location.get('location_id') if isinstance(location, dict) else location[0] if location else None
+    location_name = location.get('location_name') if isinstance(location, dict) else location[1] if location else None
+    event_id = event.get('event_id') if isinstance(event, dict) else event[0] if event else None
+
+    check_text = check_parameters(user, location_id)
 
     if check_text:
         await update.message.reply_text(check_text)
@@ -277,20 +310,20 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if 'отменить' in command_text.lower():
-        success = remove_volunteer_from_event(user['user_id'], event['event_id'])
+        success = remove_volunteer_from_event(user_id, event_id)
         if success:
-            positions = get_event_data(location['location_id'])
+            positions = get_event_data(location_id)
             if positions:
-                await update.message.reply_text(get_position_text(location['location_name'], positions))
+                await update.message.reply_text(get_position_text(location_name, positions))
         else:
             await update.message.reply_text("❌ Не удалось отменить запись")
         return
        
-    success = add_volunteer_to_event(command_text, user['user_id'], event['event_id'])
+    success = add_volunteer_to_event(command_text, user_id, event_id)
     if success:
-        positions = get_event_data(location['location_id'])
+        positions = get_event_data(location_id)
         if positions:
-            event_text = get_position_text(location['location_name'], positions)
+            event_text = get_position_text(location_name, positions)
 
         keyboard = [
             ["✍️ Записаться волонтером", "❌ Отменить запись"],
@@ -320,15 +353,18 @@ async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         location = cursor.fetchone()
         
         if location:
-            context.user_data['current_location'] = location
+            context.user_data['current_location'] = {
+                'location_id': location[0],
+                'location_name': location[1]
+            }
 
-            event = get_or_create_event(location['location_id'])
+            event = get_or_create_event(location[0]) 
             context.user_data['current_event'] = event
 
-            positions = get_event_data(location['location_id'])
+            positions = get_event_data(location[0]) 
 
             if positions:
-                event_text = get_position_text(location['location_name'], positions)
+                event_text = get_position_text(location[1], positions)  
 
             keyboard = [
                 ["✍️ Записаться волонтером", "❌ Отменить запись"],
@@ -342,7 +378,7 @@ async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(event_text)
 
         user = context.user_data.get('current_user')
-        check_text = check_parameters(user, location['location_id'] if location else None)
+        check_text = check_parameters(user, location[0] if location else None)  
         if check_text:
             await update.message.reply_text(check_text)   
             return
@@ -406,6 +442,12 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     
     logger.info("🚀 Бот запускается...")
+
+    if IS_RAILWAY:
+        logger.info("📍 Режим: Railway")
+    else:
+        logger.info("📍 Режим: Локальная разработка (PostgreSQL)")
+
     while True:
         try:
             application.run_polling()
