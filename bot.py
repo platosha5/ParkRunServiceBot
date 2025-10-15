@@ -84,127 +84,127 @@ def get_next_saturday():
 next_saturday = get_next_saturday()
 
 def get_or_create_user(telegram_user):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
+        (telegram_user.id,)
+    )
+    user = cursor.fetchone()
+    
+    if user is None:
+        cursor.execute('''
+            INSERT INTO users (user_id, first_name, last_name, full_name, telegram_name)
+            VALUES (%s, %s, %s, %s, %s)
+        ''', (
+            telegram_user.id,
+            telegram_user.first_name or '',
+            telegram_user.last_name or '',
+            telegram_user.full_name or '',
+            getattr(telegram_user, 'name', '') or '',
+        ))
+        conn.commit()
         
         cursor.execute(
             'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
             (telegram_user.id,)
         )
         user = cursor.fetchone()
-        
-        if user is None:
-            cursor.execute('''
-                INSERT INTO users (user_id, first_name, last_name, full_name, telegram_name)
-                VALUES (%s, %s, %s, %s, %s)
-            ''', (
-                telegram_user.id,
-                telegram_user.first_name or '',
-                telegram_user.last_name or '',
-                telegram_user.full_name or '',
-                getattr(telegram_user, 'name', '') or '',
-            ))
-            conn.commit()
-            
-            cursor.execute(
-                'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
-                (telegram_user.id,)
-            )
-            user = cursor.fetchone()
     
     return user
 
 def get_or_create_event(location_id):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        'SELECT event_id FROM events WHERE location_id = %s AND event_date = %s', 
+        (location_id, next_saturday)
+    )
+    event = cursor.fetchone()
+    
+    if event is None:
+        cursor.execute('''
+            INSERT INTO events (location_id, event_date)
+            VALUES (%s, %s)
+        ''', (
+            location_id,
+            next_saturday
+        ))
+        conn.commit()
         
         cursor.execute(
             'SELECT event_id FROM events WHERE location_id = %s AND event_date = %s', 
             (location_id, next_saturday)
         )
         event = cursor.fetchone()
-        
-        if event is None:
-            cursor.execute('''
-                INSERT INTO events (location_id, event_date)
-                VALUES (%s, %s)
-            ''', (
-                location_id,
-                next_saturday
-            ))
-            conn.commit()
-            
-            cursor.execute(
-                'SELECT event_id FROM events WHERE location_id = %s AND event_date = %s', 
-                (location_id, next_saturday)
-            )
-            event = cursor.fetchone()
     
     return event
 
 def get_event_data(location_id):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            SELECT 
-                R.role_id,
-                R.role_full_name, 
-                COALESCE(U.full_name, '') as volunteer_name,
-                U.telegram_name
-            FROM roles AS R
-            LEFT JOIN volunteers AS V ON V.role_id = R.role_id 
-                AND V.event_id IN (
-                    SELECT event_id FROM events 
-                    WHERE event_date = %s AND location_id = %s
-                )
-            LEFT JOIN users AS U ON U.user_id = V.user_id
-            ORDER BY R.sort_id
-        ''', (next_saturday, location_id))
-        
-        positions = cursor.fetchall()
-        
-        if not positions:
-            return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT 
+            R.role_id,
+            R.role_full_name, 
+            COALESCE(U.full_name, '') as volunteer_name,
+            U.telegram_name
+        FROM roles AS R
+        LEFT JOIN volunteers AS V ON V.role_id = R.role_id 
+            AND V.event_id IN (
+                SELECT event_id FROM events 
+                WHERE event_date = %s AND location_id = %s
+            )
+        LEFT JOIN users AS U ON U.user_id = V.user_id
+        ORDER BY R.sort_id
+    ''', (next_saturday, location_id))
+    
+    positions = cursor.fetchall()
+    
+    if not positions:
+        return None
     
     return positions
 
 def add_volunteer_to_event(role_text, user_id, event_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Получаем role_id по названию роли
+        cursor.execute(
+            'SELECT role_id FROM roles WHERE role_full_name = %s', 
+            (role_text,)
+        )
+        role_result = cursor.fetchone()
+        
+        if not role_result:
+            logger.error(f"Роль '{role_text}' не найдена")
+            return False
             
-            # Получаем role_id по названию роли
-            cursor.execute(
-                'SELECT role_id FROM roles WHERE role_full_name = %s', 
-                (role_text,)
-            )
-            role_result = cursor.fetchone()
-            
-            if not role_result:
-                logger.error(f"Роль '{role_text}' не найдена")
-                return False
-                
-            role_id = role_result[0]
-            
-            # Проверяем, не записан ли уже пользователь на эту роль
-            cursor.execute(
-                'SELECT user_id, role_id, event_id FROM volunteers WHERE user_id = %s AND role_id = %s AND event_id = %s', 
-                (user_id, role_id, event_id)
-            )
-            existing_volunteer = cursor.fetchone()
-            
-            if existing_volunteer:
-                return False
-            else:
-                # Создаем новую запись
-                cursor.execute('''
-                    INSERT INTO volunteers (user_id, role_id, event_id)
-                    VALUES (%s, %s, %s)
-                ''', (user_id, role_id, event_id))
-            
-            conn.commit()
-            return True
+        role_id = role_result[0]
+        
+        # Проверяем, не записан ли уже пользователь на эту роль
+        cursor.execute(
+            'SELECT user_id, role_id, event_id FROM volunteers WHERE user_id = %s AND role_id = %s AND event_id = %s', 
+            (user_id, role_id, event_id)
+        )
+        existing_volunteer = cursor.fetchone()
+        
+        if existing_volunteer:
+            return False
+        else:
+            # Создаем новую запись
+            cursor.execute('''
+                INSERT INTO volunteers (user_id, role_id, event_id)
+                VALUES (%s, %s, %s)
+            ''', (user_id, role_id, event_id))
+        
+        conn.commit()
+        return True
             
     except Exception as e:
         logger.error(f"Ошибка при добавлении волонтера: {e}")
@@ -212,14 +212,14 @@ def add_volunteer_to_event(role_text, user_id, event_id):
 
 def remove_volunteer_from_event(user_id, event_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'DELETE FROM volunteers WHERE event_id = %s AND user_id = %s', 
-                (event_id, user_id)
-            )
-            conn.commit()
-            return cursor.rowcount > 0
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            'DELETE FROM volunteers WHERE event_id = %s AND user_id = %s', 
+            (event_id, user_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
             
     except Exception as e:
         logger.error(f"Ошибка при отмене записи: {e}")
