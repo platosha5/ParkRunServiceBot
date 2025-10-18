@@ -79,7 +79,7 @@ def get_next_saturday():
     days_until_saturday = (5 - today.weekday()) % 7
     if days_until_saturday == 0:
         days_until_saturday = 7
-    return (today + timedelta(days=days_until_saturday)).strftime("%d.%m.%Y")
+    return (today + timedelta(days=days_until_saturday)).strftime("%Y-%m-%d")
 
 next_saturday = get_next_saturday()
 
