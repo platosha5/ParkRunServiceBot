@@ -170,45 +170,83 @@ def get_event_data(location_id):
     return positions
 
 def add_volunteer_to_event(role_text, user_id, event_id):
+    conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Получаем role_id по названию роли
+        # Получаем данные о роли и проверяем существование
         cursor.execute(
-            'SELECT role_id FROM roles WHERE role_full_name = %s', 
+            'SELECT role_id, is_uniq FROM roles WHERE role_full_name = %s', 
             (role_text,)
         )
         role_result = cursor.fetchone()
         
         if not role_result:
             logger.error(f"Роль '{role_text}' не найдена")
-            return False
+            return False, f"Роль '{role_text}' не найдена"
             
-        role_id = role_result[0]
-        
-        # Проверяем, не записан ли уже пользователь на эту роль
+        role_id, is_uniq = role_result
+
+        # Проверяем, не записан ли уже пользователь
         cursor.execute(
-            'SELECT user_id, role_id, event_id FROM volunteers WHERE user_id = %s AND role_id = %s AND event_id = %s', 
+            'SELECT 1 FROM volunteers WHERE user_id = %s AND role_id = %s AND event_id = %s', 
             (user_id, role_id, event_id)
         )
-        existing_volunteer = cursor.fetchone()
+        if cursor.fetchone():
+            logger.error(f"Ты уже записан на позицию '{role_text}'")
+            return False, f"Ты уже записан на позицию '{role_text}'. Пожалуйста, выбери другую"
+
+        # Проверяем уникальность роли
+        if is_uniq:
+            cursor.execute(
+                'SELECT 1 FROM volunteers WHERE role_id = %s AND event_id = %s', 
+                (role_id, event_id)
+            )
+            if cursor.fetchone():
+                logger.error(f"Позиция '{role_text}' уже занята")
+                return False, f"Позиция '{role_text}' уже занята. Пожалуйста, выбери другую"
+
+        # Проверяем исключения
+        exclusion1 = ["⏱️ Секундомер", "📱 Сканер штрих-кодов"]
+        exclusion2 = ["⏱️ Секундомер", "🎫 Раздача карточек позиций"]
         
-        if existing_volunteer:
-            return False
-        else:
-            # Создаем новую запись
-            cursor.execute('''
-                INSERT INTO volunteers (user_id, role_id, event_id)
-                VALUES (%s, %s, %s)
-            ''', (user_id, role_id, event_id))
+        cursor.execute(
+            '''SELECT R.role_full_name 
+               FROM volunteers V 
+               JOIN roles R ON R.role_id = V.role_id 
+               WHERE V.user_id = %s AND V.event_id = %s AND R.role_full_name IN %s''',
+            (user_id, event_id, tuple(exclusion1 + exclusion2))
+        )
+        conflicting_roles = [row[0] for row in cursor.fetchall()]
+        
+        for exclusion_list in [exclusion1, exclusion2]:
+            if role_text in exclusion_list:
+                for conflicting_role in conflicting_roles:
+                    if conflicting_role in exclusion_list:
+                        result_test = f"Ты уже записан на позицию '{conflicting_role}', нельзя также записаться на '{role_text}'"
+                        logger.error(result_test)
+                        return False, result_test
+
+        # Создаем новую запись
+        cursor.execute(
+            'INSERT INTO volunteers (user_id, role_id, event_id) VALUES (%s, %s, %s)',
+            (user_id, role_id, event_id)
+        )
         
         conn.commit()
-        return True
+        logger.info(f"Пользователь {user_id} успешно записан на роль '{role_text}' в мероприятии {event_id}")
+        return True, "Ok"
             
     except Exception as e:
+        if conn:
+            conn.rollback()
         logger.error(f"Ошибка при добавлении волонтера: {e}")
-        return False
+        return False, f"Ошибка при добавлении волонтера: {e}"
+    finally:
+        if conn:
+            cursor.close()
+            conn.close()
 
 def remove_volunteer_from_event(user_id, event_id):
     try:
@@ -298,8 +336,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if 'записаться' in command_text.lower():
-        keyboard = [
-            ["👨‍💼 Руководитель забега", "Координатор волонтеров", "💻 Обработка результатов"],
+        keyboard = [ 
+            ["Координатор волонтеров", "💻 Обработка результатов", "Маршал"],
             ["🏃‍♂ Подготовка трассы", "🤸‍♂ Разминка", "🏃‍♂ Замыкающий"],
             ["⏱️ Секундомер", "🎫 Раздача карточек позиций", "📱 Сканер штрих-кодов"],
             ["📸 Фотограф", "☕ Буфет", "❓ Другое"],
@@ -319,8 +357,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось отменить запись")
         return
        
-    success = add_volunteer_to_event(command_text, user_id, event_id)
-    if success:
+    result = add_volunteer_to_event(command_text, user_id, event_id)
+    if result[0]:
         positions = get_event_data(location_id)
         if positions:
             event_text = get_position_text(location_name, positions)
@@ -332,7 +370,7 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(event_text, reply_markup=reply_markup)
     else:
-        await update.message.reply_text("❌ Не удалось записаться на выбранную позицию")
+        await update.message.reply_text(result[1])
 
 async def location_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = update.message.text.strip()
