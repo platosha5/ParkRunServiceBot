@@ -1,6 +1,6 @@
 import os
 import time
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, User
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 from datetime import datetime, timedelta
 import logging
@@ -84,33 +84,69 @@ def get_next_saturday():
 next_saturday = get_next_saturday()
 
 def get_or_create_user(telegram_user):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute(
-        'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
-        (telegram_user.id,)
-    )
-    user = cursor.fetchone()
-    
-    if user is None:
-        cursor.execute('''
-            INSERT INTO users (user_id, first_name, last_name, full_name, telegram_name)
-            VALUES (%s, %s, %s, %s, %s)
-        ''', (
-            telegram_user.id,
-            telegram_user.first_name or '',
-            telegram_user.last_name or '',
-            telegram_user.full_name or '',
-            getattr(telegram_user, 'name', '') or '',
-        ))
-        conn.commit()
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        telegram_id = telegram_user.id if telegram_user.id else None
+        first_name = telegram_user.first_name if telegram_user.first_name else None
+        last_name = telegram_user.last_name if telegram_user.last_name else None
+        full_name = telegram_user.full_name if telegram_user.full_name else None
+        telegram_name = getattr(telegram_user, 'name', '') or None
+        user = None
+
+        if telegram_id:
+            cursor.execute(
+                'SELECT user_id, telegram_id, first_name, last_name, full_name, telegram_name, qr_code FROM users WHERE telegram_id = %s', 
+                (telegram_id,)
+            )
+            user = cursor.fetchone()
         
+        if user is None and telegram_name:
+            cursor.execute(
+                'SELECT user_id, telegram_id, first_name, last_name, full_name, telegram_name, qr_code FROM users WHERE telegram_name = %s', 
+                (telegram_name,)
+            )
+            user = cursor.fetchone()
+
+        if user:
+            db_user_id, db_telegram_id, db_first_name, db_last_name, db_full_name, db_telegram_name, qr_code = user
+            
+            if (db_telegram_id != telegram_id or db_first_name != first_name or 
+                db_last_name != last_name or db_full_name != full_name):
+                
+                cursor.execute('''
+                    UPDATE users 
+                    SET telegram_id = %s, first_name = %s, last_name = %s, full_name = %s, telegram_name = %s
+                    WHERE user_id = %s
+                ''', (telegram_id, first_name, last_name, full_name, telegram_name, db_user_id))
+                conn.commit()
+        
+        else:
+            cursor.execute('''
+                INSERT INTO users (telegram_id, first_name, last_name, full_name, telegram_name)
+                VALUES (%s, %s, %s, %s, %s)
+            ''', (
+                telegram_id,
+                first_name,
+                last_name,
+                full_name,
+                telegram_name,
+            ))
+            conn.commit()
+    
         cursor.execute(
-            'SELECT user_id, first_name, full_name, qr_code FROM users WHERE user_id = %s', 
-            (telegram_user.id,)
+            'SELECT user_id, telegram_id, first_name, full_name, telegram_name, qr_code FROM users WHERE telegram_name = %s', 
+            (telegram_name,)
         )
         user = cursor.fetchone()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        error_text = f"{e}"    
+        logger.error(error_text)
+        return ""
     
     return user
 
@@ -169,12 +205,42 @@ def get_event_data(location_id):
     
     return positions
 
+def get_role_by_code(role_code):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            'SELECT role_full_name FROM roles WHERE lower(role_code) = lower(%s)', 
+            (role_code,)
+        )
+        role_result = cursor.fetchone()
+        
+        if not role_result:
+            logger.error(f"Роль c кодом '{role_code}' не найдена")
+            return ""
+
+        return role_result[0] if role_result else ""
+        
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        error_text = f"Ошибка при получении названия роли по коду '{role_code}': {e}"    
+        logger.error(error_text)
+        return ""
+    finally:
+        if cursor:  
+            cursor.close()
+        if conn:
+            conn.close()
+
 def add_volunteer_to_event(role_text, user_id, event_id):
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         # Получаем данные о роли и проверяем существование
         cursor.execute(
             'SELECT role_id, is_uniq FROM roles WHERE role_full_name = %s', 
@@ -314,7 +380,86 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if check_text:
         await update.message.reply_text(check_text)
 
+async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        command_list = update.message.text.strip().split()
+
+        current_user = update.effective_user
+        current_telegram_name = getattr(current_user, 'name', '') or None
+
+        location = context.user_data.get('current_location')
+        location_id = location.get('location_id') if isinstance(location, dict) else location[0] if location and len(location) > 0 else None
+        location_name = location.get('location_name') if isinstance(location, dict) else location[1] if location and len(location) > 1 else None
+        
+        event = get_or_create_event(location_id) 
+        context.user_data['current_event'] = event
+        event_id = event.get('event_id') if isinstance(event, dict) else event[0] if event and len(event) > 0 else None
+
+        if not location or not event:
+            await update.message.reply_text("⚠️ Сначала выполни /start и выбери локацию через /location")
+            return
+
+        positions = get_event_data(location_id)
+        coord_positions = [row for row in positions if row[1] == 'Координатор волонтеров' and row[3] == current_telegram_name]
+
+        if not coord_positions:
+            await update.message.reply_text("⚠️ Для записи других сначала запишись на позицию 'Координатов волонтеров'")
+            return
+
+        if len(command_list) == 2:  
+            command = command_list[0]  # команда (/dir, /scan, /cards)
+            tg_name = command_list[1]
+            if tg_name.startswith('@'):
+                tg_name = tg_name[1:]
+            
+            command_text = get_role_by_code(command.lstrip('/'))  
+            
+            try:
+                user = User(
+                    id=0,
+                    first_name=None,
+                    is_bot = False,
+                    username = tg_name,
+                )
+
+                tg_user = get_or_create_user(user)
+                user_id = tg_user[0]
+            except Exception as e:
+                await update.message.reply_text(f"❌ Не удалось найти пользователя {tg_name}")
+                logger.error(f"Ошибка получения пользователя: {e}")
+                return
+
+        else:
+            await update.message.reply_text("❌ Неверный формат команды. Используйте: /команда @username")
+            return
+
+        result = add_volunteer_to_event(command_text, user_id, event_id)
+        
+        if result and result[0]:  
+            positions = get_event_data(location_id)
+            event_text = ""
+            
+            if positions:
+                event_text = get_position_text(location_name, positions)
+            else:
+                event_text = f"📍 {location_name}\n\nНет доступных позиций"
+
+            keyboard = [
+                ["✍️ Записаться волонтером", "❌ Отменить запись"],
+            ]
+
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            await update.message.reply_text(event_text, reply_markup=reply_markup)
+        else:
+            error_message = result[1] if result and len(result) > 1 else "Неизвестная ошибка"
+            await update.message.reply_text(f"❌ {error_message}")
+            
+    except Exception as e:
+        logger.error(f"Ошибка в handle_commands: {e}")
+        await update.message.reply_text("❌ Произошла ошибка при обработке команды")
+
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    
     command_text = update.message.text
     user = context.user_data.get('current_user')
     location = context.user_data.get('current_location')
@@ -355,8 +500,8 @@ async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(get_position_text(location_name, positions))
         else:
             await update.message.reply_text("❌ Не удалось отменить запись")
-        return
-       
+        return 
+
     result = add_volunteer_to_event(command_text, user_id, event_id)
     if result[0]:
         positions = get_event_data(location_id)
@@ -479,6 +624,9 @@ def main():
     application.add_handler(CommandHandler("locationlist", location_list))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_buttons))
     
+    command_filter = filters.Regex(r'^(/dir|/scanner|/cards|/sec|/another|/photo|/coord|/prepare)')
+    application.add_handler(MessageHandler(command_filter, handle_commands))
+
     logger.info("🚀 Бот запускается...")
 
     if IS_RAILWAY:
