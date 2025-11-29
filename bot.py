@@ -363,7 +363,9 @@ def get_position_text(location_name, positions):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = get_or_create_user(update.effective_user)
     context.user_data['current_user'] = user
-    
+    command_list = update.message.text.strip().split()
+    location_id = None
+
     user_name = update.effective_user.first_name
     if not user_name:
         user_name = "друг"
@@ -375,10 +377,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(welcome_text)
 
-    check_text = check_parameters(user, None)
+    if len(command_list) == 2:  
+        tg_group = command_list[1]
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                "SELECT location_id, location_name FROM locations WHERE tg_group = %s AND statecode = 0 LIMIT 1", 
+                (tg_group,)
+            )
+            location = cursor.fetchone()
+            
+            if location:
+                location_id = location[0]
+                context.user_data['current_location'] = {
+                    'location_id': location[0],
+                    'location_name': location[1]
+                }
+
+        except Exception as e:
+            await update.message.reply_text(f"⚠️ Произошла ошибка при определении локации через {tg_group}: {str(e)}")
+            logger.error(f"Ошибка при определении локации через {tg_group}: {e}")
+            
+        finally:
+            cursor.close()
+            conn.close()
+
+    check_text = check_parameters(user, location_id)
 
     if check_text:
         await update.message.reply_text(check_text)
+        return ""
+    
+    event = get_or_create_event(location_id) 
+    context.user_data['current_event'] = event
+
+    positions = get_event_data(location_id) 
+
+    if positions:
+        event_text = get_position_text(location[1], positions)  
+
+    keyboard = [
+        ["✍️ Записаться волонтером", "❌ Отменить запись"],
+    ]
+
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text(event_text, reply_markup=reply_markup)
 
 async def handle_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -583,7 +628,7 @@ async def location_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         locations = cursor.fetchall()
         
         if locations:
-            location_text = "📋 Список доступных локаций:\n\n" + "\n".join([f"• {loc['location_name']}" for loc in locations])
+            location_text = "📋 Список доступных локаций:\n\n" + "\n".join([f"• {loc[0]}" for loc in locations])
         else:
             location_text = "❌ Нет доступных локаций"
             
